@@ -129,12 +129,12 @@ void* kalloc(size_t sz) {
         return nullptr;
     }
 
-    //int pageno = 0;
+    int pageno = 0;
     int page_increment = 1;
     // In the handout code, `kalloc` returns the first free page.
     // Alternate search strategies can be faster and/or expose bugs elsewhere.
     // This initialization returns a random free page:
-    int pageno = rand(0, NPAGES - 1);
+    // int pageno = rand(0, NPAGES - 1);
     // This initialization remembers the most-recently-allocated page and
     // starts the search from there:
     //     static int pageno = 0;
@@ -187,7 +187,7 @@ void process_setup(pid_t pid, const char* program_name) {
     vmiter new_it = vmiter(pt, 0x1000); 
     
 
-    while (kernel_it.present() && kernel_it.va() < PROC_START_ADDR){
+    while (kernel_it.va() < PROC_START_ADDR){
   
         //int perm = PTE_P | PTE_W; 
         int r = new_it.try_map(kernel_it.pa(), kernel_it.perm());
@@ -211,13 +211,13 @@ void process_setup(pid_t pid, const char* program_name) {
             // `a` is the process virtual address for the next code/data page
             // (The handout code requires that the corresponding physical
             // address is currently free.)
-            //int perm = PTE_P | PTE_U; 
+            
             // assert(physpages[a / PAGESIZE].refcount == 0);
             // ++physpages[a / PAGESIZE].refcount;
 
             // map the permissions to a given process 
             uintptr_t pa = (uintptr_t) kalloc(PAGESIZE); 
-            //new_it = new_it.find(a); 
+             
             kernel_it = kernel_it.find(a); 
             new_it += kernel_it.va() - new_it.va(); 
 
@@ -230,22 +230,40 @@ void process_setup(pid_t pid, const char* program_name) {
     // copy instructions and data from program image into process memory
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
         
+        // vmiter vir_itr = vmiter(pt, 0x1000); 
+        // vir_itr = vir_itr.find(seg.va()); //find virtual address - .pa() will pull its physical address
+        // memset((void*) vir_itr.pa(), 0,  seg.size()); 
+        // memcpy((void*) vir_itr.pa(), seg.data(),  seg.data_size()); 
+         
+
         vmiter vir_itr = vmiter(pt, 0x1000); 
         vir_itr = vir_itr.find(seg.va()); //find virtual address - .pa() will pull its physical address
-         
-        memset((void*) vir_itr.pa(), 0, seg.size());
-        //memcpy((void*) vir_itr.pa(), seg.data(), seg.data_size()); // how can we handle disjoint segment sizes in memcpy?
+        // memset((void*) vir_itr.pa(), 0, seg.size());
+     
         // to handle disjoint segments in physical memory, memcpy 1 by 1 
-        int cntr = 0; 
-        for (uintptr_t a = round_down(seg.va(), PAGESIZE);
-            a < seg.va() + seg.size() - PAGESIZE;
-            a += PAGESIZE) {
-                memcpy((void*) vir_itr.pa(), seg.data() + cntr * PAGESIZE, PAGESIZE); 
+        int cntr1 = 0; 
+        for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.size() - PAGESIZE; a += PAGESIZE) {
+                memcpy((void*) vir_itr.pa(), seg.data() + cntr1 * PAGESIZE, PAGESIZE); 
                 vir_itr += PAGESIZE; 
-                ++cntr; 
+                ++cntr1; 
             }
-        memset((void*) vir_itr.pa(), 0,  seg.size() - cntr * PAGESIZE); 
-        memcpy((void*) vir_itr.pa(), seg.data() + cntr * PAGESIZE,  seg.data_size() - cntr * PAGESIZE); 
+
+
+        vmiter vir_itr2 = vmiter(pt, 0x1000); 
+        vir_itr2 = vir_itr2.find(seg.va()); //find virtual address - .pa() will pull its physical address
+        int cntr2 = 0;
+        for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.data_size() - PAGESIZE; a += PAGESIZE) {
+                memcpy((void*) vir_itr2.pa(), seg.data() + cntr2 * PAGESIZE, PAGESIZE); 
+                vir_itr2 += PAGESIZE;
+                ++cntr2; 
+            }
+
+        size_t data_sz = seg.data_size() - cntr2 * PAGESIZE;
+        log_printf("%x\t%x\t%lu\n", vir_itr.pa(), seg.data() + cntr2 * PAGESIZE, data_sz);
+        log_printf("%lu\t%lu\t%lu\n", seg.data_size(), cntr2, PAGESIZE);
+        memset((void*) vir_itr.pa(), 0,  seg.size() - cntr1 * PAGESIZE);
+        memcpy((void*) vir_itr2.pa(), seg.data() + cntr2 * PAGESIZE, seg.data_size() - cntr2 * PAGESIZE); 
+        // log_printf("%lu \n", seg.size());
 
         }
     
@@ -255,7 +273,7 @@ void process_setup(pid_t pid, const char* program_name) {
 
     // allocate and map stack segment
     // Compute process virtual address for stack page
-    //uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE; 
+    // uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE; 
     uintptr_t stack_addr = 0x300000 - PAGESIZE; 
     
     
@@ -279,7 +297,46 @@ void process_setup(pid_t pid, const char* program_name) {
    
 }
 
+int fork(pid_t parent_pid){
 
+    if(parent_pid < 0 || parent_pid >= PID_MAX || ptable[parent_pid].pid == -1){
+        return -1; 
+    }
+
+    x86_64_pagetable* child_pt = (x86_64_pagetable*) kalloc_pagetable(); 
+    ptable[parent_pid].pagetable = child_pt;
+
+
+    //look for a slot in the ptable[] array 
+    int child_pid = -1; 
+    for (int i = 1; i < PID_MAX; ++i){
+        if (ptable[i].pid == -1){ // there's a free slot here! 
+            child_pid = i; 
+            ptable[child_pid].pagetable = child_pt; 
+            ptable[child_pid].pid = child_pid; 
+            break; 
+        }
+        return -1; //failed to find a free slot 
+    } 
+    // iterate through parent's page tables 
+    for (uintptr_t addr = 0; addr < MEMSIZE_PHYSICAL; addr += PAGESIZE){
+        vmiter parent_itr(ptable[parent_pid].pagetable, addr); 
+        vmiter child_itr(child_pt, addr); 
+
+        if (parent_itr.present()){
+            if (parent_itr.va() < PROC_SIZE){
+                void* page = kalloc(PAGESIZE); 
+                memcpy(page, (const void*)parent_itr.pa(), PAGESIZE); 
+                child_itr.try_map((uintptr_t)page, parent_itr.perm()); 
+            } else {
+                int r = child_itr.try_map(ptable[parent_pid].pagetable, parent_itr.perm()); 
+                assert(r == 0); 
+            }
+        }
+    }
+    //otherwise, fail
+    return child_pid; 
+}
 
 // exception(regs)
 //    Exception handler (for interrupts, traps, and faults).
@@ -412,6 +469,12 @@ uintptr_t syscall(regstate* regs) {
     case SYSCALL_PAGE_ALLOC:
         return syscall_page_alloc(current->regs.reg_rdi);
 
+    case SYSCALL_FORK: 
+        //fork(current->pid);
+        schedule(); 
+         
+
+
     default:
         proc_panic(current, "Unhandled system call %ld (pid=%d, rip=%p)!\n",
                    regs->reg_rax, current->pid, regs->reg_rip);
@@ -435,7 +498,7 @@ int syscall_page_alloc(uintptr_t addr) {
     if (!pa){
         return -1; 
     }
-    
+
     memset((void*) pa, 0, PAGESIZE);
 
    

@@ -73,7 +73,7 @@ void kernel_start(const char* command) {
         if (addr > 0 && addr < 0x100000 && addr != 0xB8000){
             perm = PTE_P | PTE_W;
         }
-        log_printf("%x\n", addr); 
+
         // install identity mapping
         int r = vmiter(kernel_pagetable, addr).try_map(addr, perm);
         assert(r == 0); // mappings during kernel_start MUST NOT fail
@@ -129,12 +129,12 @@ void* kalloc(size_t sz) {
         return nullptr;
     }
 
-    int pageno = 0;
+    //int pageno = 0;
     int page_increment = 1;
     // In the handout code, `kalloc` returns the first free page.
     // Alternate search strategies can be faster and/or expose bugs elsewhere.
     // This initialization returns a random free page:
-    //     int pageno = rand(0, NPAGES - 1);
+    int pageno = rand(0, NPAGES - 1);
     // This initialization remembers the most-recently-allocated page and
     // starts the search from there:
     //     static int pageno = 0;
@@ -182,8 +182,10 @@ void process_setup(pid_t pid, const char* program_name) {
     x86_64_pagetable* pt = (x86_64_pagetable*) kalloc_pagetable(); 
     ptable[pid].pagetable = pt;
 
+
     vmiter kernel_it = vmiter(kernel_pagetable, 0x1000); //maps permissions in kernel pagetable to virtual address = physc addr 
     vmiter new_it = vmiter(pt, 0x1000); 
+    
 
     while (kernel_it.present() && kernel_it.va() < PROC_START_ADDR){
   
@@ -196,7 +198,7 @@ void process_setup(pid_t pid, const char* program_name) {
         
     }
     
-    
+
     // obtain reference to program image
     // (The program image models the process executable.)
     program_image pgm(program_name);
@@ -209,51 +211,69 @@ void process_setup(pid_t pid, const char* program_name) {
             // `a` is the process virtual address for the next code/data page
             // (The handout code requires that the corresponding physical
             // address is currently free.)
-            int perm = PTE_P | PTE_U; 
-            assert(physpages[a / PAGESIZE].refcount == 0);
-            ++physpages[a / PAGESIZE].refcount;
+            //int perm = PTE_P | PTE_U; 
+            // assert(physpages[a / PAGESIZE].refcount == 0);
+            // ++physpages[a / PAGESIZE].refcount;
 
             // map the permissions to a given process 
-            //uintptr_t pa = (uintptr_t) kalloc(PAGESIZE); 
+            uintptr_t pa = (uintptr_t) kalloc(PAGESIZE); 
+            //new_it = new_it.find(a); 
             kernel_it = kernel_it.find(a); 
-            new_it += kernel_it.va() - new_it.va();
+            new_it += kernel_it.va() - new_it.va(); 
 
-            int r = new_it.try_map(kernel_it.pa(), PTE_P | PTE_W | PTE_U);
+            int r = new_it.try_map(pa, PTE_P | PTE_W | PTE_U); 
             assert(r == 0); 
 
-    
         }
     }
 
     // copy instructions and data from program image into process memory
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
-        memset((void*) seg.va(), 0, seg.size());
-        memcpy((void*) seg.va(), seg.data(), seg.data_size());
-    }
+        
+        vmiter vir_itr = vmiter(pt, 0x1000); 
+        vir_itr = vir_itr.find(seg.va()); //find virtual address - .pa() will pull its physical address
+         
+        memset((void*) vir_itr.pa(), 0, seg.size());
+        //memcpy((void*) vir_itr.pa(), seg.data(), seg.data_size()); // how can we handle disjoint segment sizes in memcpy?
+        // to handle disjoint segments in physical memory, memcpy 1 by 1 
+        int cntr = 0; 
+        for (uintptr_t a = round_down(seg.va(), PAGESIZE);
+            a < seg.va() + seg.size() - PAGESIZE;
+            a += PAGESIZE) {
+                memcpy((void*) vir_itr.pa(), seg.data() + cntr * PAGESIZE, PAGESIZE); 
+                vir_itr += PAGESIZE; 
+                ++cntr; 
+            }
+        memset((void*) vir_itr.pa(), 0,  seg.size() - cntr * PAGESIZE); 
+        memcpy((void*) vir_itr.pa(), seg.data() + cntr * PAGESIZE,  seg.data_size() - cntr * PAGESIZE); 
+
+        }
+    
 
     // mark entry point
     ptable[pid].regs.reg_rip = pgm.entry();
 
     // allocate and map stack segment
     // Compute process virtual address for stack page
-    uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE;
+    //uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE; 
+    uintptr_t stack_addr = 0x300000 - PAGESIZE; 
+    
+    
+    uintptr_t pa = (uintptr_t) kalloc(PAGESIZE); 
     // The handout code requires that the corresponding physical address
     // is currently free.
-    assert(physpages[stack_addr / PAGESIZE].refcount == 0);
-    ++physpages[stack_addr / PAGESIZE].refcount;
+    // assert(physpages[stack_addr / PAGESIZE].refcount == 0);
+    // ++physpages[stack_addr / PAGESIZE].refcount;
 
     kernel_it = kernel_it.find(stack_addr); 
     new_it += kernel_it.va() - new_it.va();
 
-    int r = new_it.try_map(kernel_it.pa(), PTE_P | PTE_W | PTE_U);
+    int r = new_it.try_map(pa, PTE_P | PTE_W | PTE_U);
     assert(r == 0); 
 
     
-
-    //vmiter(pt, stack_addr). try_map(stack_pa, PTE_P | PTE_W | PTE_U);
-    
     ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
-    //ptable[pid].regs.reg_rip = pgm.entry();
+    
     // mark process as runnable
     ptable[pid].state = P_RUNNABLE;
    
@@ -408,9 +428,17 @@ uintptr_t syscall(regstate* regs) {
 //    in `u-lib.hh` (but in the handout code, it does not).
 
 int syscall_page_alloc(uintptr_t addr) {
-    assert(physpages[addr / PAGESIZE].refcount == 0);
-    ++physpages[addr / PAGESIZE].refcount;
-    memset((void*) addr, 0, PAGESIZE);
+    uintptr_t pa = (uintptr_t) kalloc(PAGESIZE); 
+    // assert(physpages[addr / PAGESIZE].refcount == 0);
+    // ++physpages[addr / PAGESIZE].refcount;
+
+    if (!pa){
+        return -1; 
+    }
+    
+    memset((void*) pa, 0, PAGESIZE);
+
+   
 
     pid_t pid = current->pid;
     x86_64_pagetable* pt = ptable[pid].pagetable;
@@ -418,9 +446,10 @@ int syscall_page_alloc(uintptr_t addr) {
     vmiter kernel_it = vmiter(kernel_pagetable, addr); 
     vmiter proc_it = vmiter(pt, addr); 
 
-    int r = proc_it.try_map(kernel_it.pa(), PTE_P | PTE_W | PTE_U);
+    int r = proc_it.try_map(pa, PTE_P | PTE_W | PTE_U);
     assert(r==0); 
 
+    
 
 
     return 0;

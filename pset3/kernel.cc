@@ -259,8 +259,8 @@ void process_setup(pid_t pid, const char* program_name) {
             }
 
         size_t data_sz = seg.data_size() - cntr2 * PAGESIZE;
-        log_printf("%x\t%x\t%lu\n", vir_itr.pa(), seg.data() + cntr2 * PAGESIZE, data_sz);
-        log_printf("%lu\t%lu\t%lu\n", seg.data_size(), cntr2, PAGESIZE);
+        //log_printf("%x\t%x\t%lu\n", vir_itr.pa(), seg.data() + cntr2 * PAGESIZE, data_sz);
+        //log_printf("%lu\t%lu\t%lu\n", seg.data_size(), cntr2, PAGESIZE);
         memset((void*) vir_itr.pa(), 0,  seg.size() - cntr1 * PAGESIZE);
         memcpy((void*) vir_itr2.pa(), seg.data() + cntr2 * PAGESIZE, seg.data_size() - cntr2 * PAGESIZE); 
         // log_printf("%lu \n", seg.size());
@@ -293,50 +293,106 @@ void process_setup(pid_t pid, const char* program_name) {
     ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
     
     // mark process as runnable
-    ptable[pid].state = P_RUNNABLE;
-   
+    ptable[pid].state = P_RUNNABLE;  
 }
+
+
+
+// copy the page tables, with the address logic 
+int copy_page_table(x86_64_pagetable* parent_pt, x86_64_pagetable* child_pt, pid_t parent_pid){
+
+    for (uintptr_t addr = 0; addr < MEMSIZE_VIRTUAL; addr += PAGESIZE){
+        vmiter parent_itr(parent_pt, addr); 
+        vmiter child_itr(child_pt, addr); 
+
+        if (parent_itr.present()){
+            uintptr_t pa = parent_itr.pa(); //grab physical addresses
+            int perm = parent_itr.perm(); //grab permissions
+
+            if (addr >= PROC_START_ADDR && perm & PTE_W){ //we live in allowed virtual memory now, with write permissions
+                pa = (uintptr_t) kalloc(PAGESIZE); 
+                
+                if (!pa){
+                    return 0; //failed to allocate enough space for the physical addresses - out of memory! 
+                }
+                // copy data over into pa, and this is what gets fed into the mapping
+                memcpy((void*)pa, (void*)parent_itr.pa(), PAGESIZE); //copy over all parent info into new allocated pagetable 
+                
+            }
+            // otherwise, we're below PROC_START_ADDR, and we can just straight up copy the physical pages in without changing pa 
+            child_itr.map(pa, perm); 
+        }
+
+    }
+    return 1; //successful copy! 
+}
+
+void free_everything(x86_64_pagetable* pt){
+
+    for (vmiter it(pt, 0); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE){
+
+        if (it.present() && it.va() != 0xB8000){ // if there's actually a physical page mapped here - and its NOT the console address
+
+            log_printf("freeing virtual address 0x%X, physical 0x%X\n", it.va(), it.pa());
+            kfree((void*)it.pa()); 
+        }
+    }
+
+    for (ptiter it(pt); !it.done(); it.next()){
+        kfree((void*)it.kptr()); 
+    }
+
+    //free the pagetable
+    kfree(pt); 
+
+}
+
+
 
 int fork(pid_t parent_pid){
 
+    log_printf("starting fork\n"); 
     if(parent_pid < 0 || parent_pid >= PID_MAX || ptable[parent_pid].pid == -1){
         return -1; 
     }
 
-    x86_64_pagetable* child_pt = (x86_64_pagetable*) kalloc_pagetable(); 
-    ptable[parent_pid].pagetable = child_pt;
-
-
+     
     //look for a slot in the ptable[] array 
-    int child_pid = -1; 
+   
     for (int i = 1; i < PID_MAX; ++i){
-        if (ptable[i].pid == -1){ // there's a free slot here! 
-            child_pid = i; 
-            ptable[child_pid].pagetable = child_pt; 
-            ptable[child_pid].pid = child_pid; 
-            break; 
-        }
-        return -1; //failed to find a free slot 
-    } 
-    // iterate through parent's page tables 
-    for (uintptr_t addr = 0; addr < MEMSIZE_PHYSICAL; addr += PAGESIZE){
-        vmiter parent_itr(ptable[parent_pid].pagetable, addr); 
-        vmiter child_itr(child_pt, addr); 
+        if (ptable[i].state == P_FREE){ // there's a free slot here! 
 
-        if (parent_itr.present()){
-            if (parent_itr.va() < PROC_SIZE){
-                void* page = kalloc(PAGESIZE); 
-                memcpy(page, (const void*)parent_itr.pa(), PAGESIZE); 
-                child_itr.try_map((uintptr_t)page, parent_itr.perm()); 
-            } else {
-                int r = child_itr.try_map(ptable[parent_pid].pagetable, parent_itr.perm()); 
-                assert(r == 0); 
+            //create a new, initially empty pagetable for the child 
+            x86_64_pagetable* child_pt = (x86_64_pagetable*) kalloc_pagetable();
+
+            if (!child_pt){
+                return -1; 
+            }
+            log_printf("made it here"); 
+
+            //initialize the child's process entry 
+            ptable[i].pagetable = child_pt; //pointer to the child's new pagetable 
+            ptable[i].pid = i; //set it to the freed id 
+            ptable[i].state = P_RUNNABLE; //set state to runnable 
+            ptable[i].regs = ptable[parent_pid].regs; //copy over the same registers from the parent
+            ptable[i].regs.reg_rax = 0; //set rax to 0 
+
+            //copy parent's pt to child 
+            if (!copy_page_table(ptable[parent_pid].pagetable, child_pt, parent_pid)){ //if the copying fails 
+                log_printf("entered fail condition\n"); 
+                free_everything(child_pt); //free everything
+                return -1; //fail condition
+            }
+
+            log_printf("child pid is %d\n", i); 
+            return i; //returns child PID
+
             }
         }
-    }
-    //otherwise, fail
-    return child_pid; 
+    return -1; 
 }
+
+
 
 // exception(regs)
 //    Exception handler (for interrupts, traps, and faults).
@@ -470,10 +526,10 @@ uintptr_t syscall(regstate* regs) {
         return syscall_page_alloc(current->regs.reg_rdi);
 
     case SYSCALL_FORK: 
-        //fork(current->pid);
-        schedule(); 
-         
-
+        return fork(current->pid);
+        
+        
+        
 
     default:
         proc_panic(current, "Unhandled system call %ld (pid=%d, rip=%p)!\n",
@@ -506,15 +562,13 @@ int syscall_page_alloc(uintptr_t addr) {
     pid_t pid = current->pid;
     x86_64_pagetable* pt = ptable[pid].pagetable;
 
-    vmiter kernel_it = vmiter(kernel_pagetable, addr); 
+    //vmiter kernel_it = vmiter(kernel_pagetable, addr); 
     vmiter proc_it = vmiter(pt, addr); 
 
     int r = proc_it.try_map(pa, PTE_P | PTE_W | PTE_U);
     assert(r==0); 
 
     
-
-
     return 0;
 }
 

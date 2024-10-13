@@ -130,7 +130,7 @@ void* kalloc(size_t sz) {
     }
 
     int pageno = 0;
-    int page_increment = 1;
+    int page_increment = 3;
     // In the handout code, `kalloc` returns the first free page.
     // Alternate search strategies can be faster and/or expose bugs elsewhere.
     // This initialization returns a random free page:
@@ -229,43 +229,31 @@ void process_setup(pid_t pid, const char* program_name) {
 
     // copy instructions and data from program image into process memory
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
-        
-        // vmiter vir_itr = vmiter(pt, 0x1000); 
-        // vir_itr = vir_itr.find(seg.va()); //find virtual address - .pa() will pull its physical address
-        // memset((void*) vir_itr.pa(), 0,  seg.size()); 
-        // memcpy((void*) vir_itr.pa(), seg.data(),  seg.data_size()); 
-         
 
         vmiter vir_itr = vmiter(pt, 0x1000); 
         vir_itr = vir_itr.find(seg.va()); //find virtual address - .pa() will pull its physical address
-        // memset((void*) vir_itr.pa(), 0, seg.size());
-     
+        
+        
         // to handle disjoint segments in physical memory, memcpy 1 by 1 
-        int cntr1 = 0; 
-        for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.size() - PAGESIZE; a += PAGESIZE) {
-                memcpy((void*) vir_itr.pa(), seg.data() + cntr1 * PAGESIZE, PAGESIZE); 
-                vir_itr += PAGESIZE; 
-                ++cntr1; 
+        size_t processed = 0; 
+        for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.size() - PAGESIZE; a += PAGESIZE){
+            size_t copysize = PAGESIZE;
+            if (seg.va() + seg.size() - a < PAGESIZE){
+                copysize = seg.va() + seg.size() - a;  //theres less than a full page left to copy  
             }
+            //otherwise, we have a full page, so copy segment data to virtual addr 
+            memcpy((void*) vir_itr.pa(), seg.data() + processed, copysize);
+            processed += copysize; 
 
-
-        vmiter vir_itr2 = vmiter(pt, 0x1000); 
-        vir_itr2 = vir_itr2.find(seg.va()); //find virtual address - .pa() will pull its physical address
-        int cntr2 = 0;
-        for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.data_size() - PAGESIZE; a += PAGESIZE) {
-                memcpy((void*) vir_itr2.pa(), seg.data() + cntr2 * PAGESIZE, PAGESIZE); 
-                vir_itr2 += PAGESIZE;
-                ++cntr2; 
-            }
-
-        size_t data_sz = seg.data_size() - cntr2 * PAGESIZE;
-        //log_printf("%x\t%x\t%lu\n", vir_itr.pa(), seg.data() + cntr2 * PAGESIZE, data_sz);
-        //log_printf("%lu\t%lu\t%lu\n", seg.data_size(), cntr2, PAGESIZE);
-        memset((void*) vir_itr.pa(), 0,  seg.size() - cntr1 * PAGESIZE);
-        memcpy((void*) vir_itr2.pa(), seg.data() + cntr2 * PAGESIZE, seg.data_size() - cntr2 * PAGESIZE); 
-        // log_printf("%lu \n", seg.size());
-
+            vir_itr += PAGESIZE; //move iterator to next page 
         }
+        if (processed < seg.size()){
+            size_t remaining = seg.size() - processed; 
+            memset((void*)(vir_itr.pa() - PAGESIZE + processed), 0, remaining); 
+        }
+    
+
+    }
     
 
     // mark entry point

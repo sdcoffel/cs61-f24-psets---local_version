@@ -129,6 +129,7 @@ void* kalloc(size_t sz) {
         return nullptr;
     }
 
+    
     int pageno = 0;
     int page_increment = 3;
     // In the handout code, `kalloc` returns the first free page.
@@ -141,13 +142,14 @@ void* kalloc(size_t sz) {
     // In Step 3, you must change the allocation to use non-sequential pages.
     // The easiest way to do this is to set page_increment to 3, but you can
     // also set `pageno` randomly.
-
-    for (int tries = 0; tries != NPAGES; ++tries) {
+    //int pageno = last_allocated_pageno; 
+    for (int tries = 0; tries != NPAGES; ++tries) { // loop through all pages to find a free one 
         uintptr_t pa = pageno * PAGESIZE;
-        if (allocatable_physical_address(pa)
-            && physpages[pageno].refcount == 0) {
-            ++physpages[pageno].refcount;
+        if (allocatable_physical_address(pa) && physpages[pageno].refcount == 0) { // if its free
+            ++physpages[pageno].refcount; //increment to the next refcount
             memset((void*) pa, 0xCC, PAGESIZE);
+            
+            
             return (void*) pa;
         }
         pageno = (pageno + page_increment) % NPAGES;
@@ -162,23 +164,21 @@ void* kalloc(size_t sz) {
 //    If `kptr == nullptr` does nothing.
 
 void kfree(void* kptr) {
-    (void) kptr;
+    if (kptr == nullptr){
+        return; // do nothing - what has been happening previously with step 6
 
-    if (!kptr){
-        return; // do nothing if this is a nullptr
+    uintptr_t pa = (uintptr_t) kptr; 
+    int pageno = pa / PAGESIZE; 
+
+    if (pa % PAGESIZE != 0 || physpages[pageno].refcount == 0){
+        return; 
     }
-
-    uintptr_t pa = (uintptr_t)kptr; //copy this from kalloc and use kptr
-    int pageno = pa / PAGESIZE;
-
-    assert(pa % PAGESIZE == 0); //make sure this is aligned
-    assert(physpages[pageno].refcount > 0); //make sure this was previously given by kalloc
     
-    //if this is zero, decrememt and clear the page 
-    if (--physpages[pageno].refcount == 0){
-        memset((void*)pa, 0, PAGESIZE); //sets everything in the page to 0 --leaks?? 
-        // worried this might build up to a bunch of zeros 
-        
+    --physpages[pageno].refcount; // should decrememnt whatever was done to refcount in kalloc
+
+    if (physpages[pageno].refcount == 0){
+        memset(kptr, 0 , PAGESIZE); 
+        } 
     }
 }
 
@@ -246,48 +246,28 @@ void process_setup(pid_t pid, const char* program_name) {
     }
     
     // copy instructions and data from program image into process memory
+    //total size of seg is 2500
+    
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
+        //log_printf("size of the entire data segment is %x\n", seg.size());
 
-        vmiter vir_itr = vmiter(pt, 0x1000); 
-        vir_itr = vir_itr.find(seg.va()); //find virtual address - .pa() will pull its physical address
-        
-        // to handle disjoint segments in physical memory, memcpy 1 by 1 
-        
-        size_t processed = 0; // number of segments that i've already copied over / processed
-        //something's wrong here. should not be subtracting pagesize in second argument 
-        //log_printf("size of segment data is %x\n", seg.data_size()); 
+
+        // vmiter vir_itr = vmiter(pt, 0x1000); 
+        // vir_itr = vir_itr.find(seg.va()); //find virtual address - .pa() will pull its physical address
+
+
+        // GOAL: loop through all of the pages that make up a segment and copy them 1 by 1 
 
         for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.size(); a += PAGESIZE){
-            
-            size_t copysize = PAGESIZE;
-           
-            // if we hit the segment where its not the full pagesize 
-            if (seg.va() + seg.size() - a < PAGESIZE){
-                //log_printf("made it to end of the segments"); 
-                copysize = seg.va() + seg.size() - a;  //theres less than a full page left to copy  
-                //log_printf("copied size for smaller segment: %x", copysize);
-            }
-
-            
-            //otherwise, we have a full page, so copy segment data to virtual addr 
-            memcpy((void*) vir_itr.pa(), seg.data() + processed, copysize);
-            //log_printf("found the %x'th full page\n", processed);
-            
-            processed += copysize; 
-            //log_printf("process after copysize: %x\n", processed);
-
-            //log_printf(" virtual address: %x, segment size: %x, iteration: %x, physical address: %x \n", seg.va(), seg.size(), a, vir_itr.pa()); 
-
-            vir_itr += PAGESIZE; //move iterator to next page 
-            //log_printf("address of vir_itr in virtual memory is %x\n", vir_itr.va());
-
+            unsigned long position = a - seg.va(); 
+            memset(vmiter(ptable[pid].pagetable, a).kptr(), 0, min(seg.size() - position, PAGESIZE)); 
+            memcpy(vmiter(ptable[pid].pagetable, a).kptr(), seg.data() + position, min(seg.data_size() - position, PAGESIZE));
         }
-        if (processed < seg.size()){
-            size_t remaining = seg.size() - processed; 
-            memset((void*)(vir_itr.pa() - PAGESIZE + processed), 0, remaining); 
-        }
-    
+
     }
+
+
+
     
 
     // mark entry point
@@ -414,31 +394,35 @@ int fork(pid_t parent_pid){
 }
 
 
-void exit(int pid){
+void sys_exit(pid_t pid){
+
     // if the process we're interested in freeing isn't already free, call kfree
+    log_printf("made it inside exit function\n");
     if (ptable[pid].state != P_FREE){
         
         x86_64_pagetable* pt = ptable[pid].pagetable;
 
-        // iterate through all the virtual addresses in a process we wanna free's pagetable 
+        if (!pt) return; 
+
+        // iterate through all the virtual addresses in a process's pagetable 
         for (vmiter it(pt, 0); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE){
             if (it.present() && it.va() != CONSOLE_ADDR){
                 kfree((void*)it.pa()); // release the corresponding physical memory
-            }
-            
+            } 
         } 
         
         // free the page table itself (could have multiple levels)
-        // PLEASE tell me i don't have to go through every page table level 
-
-
-        //mark process as free
-        ptable[pid].state = P_FREE; 
-        ptable[pid].pagetable = nullptr; //set page table pointer to a nullptr 
+        for (ptiter pt_it(pt); !pt_it.done(); pt_it.next()){
+            if (pt_it.pa() != 0){
+                kfree((void*)pt_it.pa()); 
+            }
+        }
+        kfree(pt); 
+        ptable[pid].state = P_FREE; //set state to free 
+        ptable[pid].pagetable = nullptr; //clear pagetable pointer
         memset(&ptable[pid].regs, 0, sizeof(ptable[pid].regs)); //clear registers
 
     }
-
 }
 
 
@@ -578,11 +562,11 @@ uintptr_t syscall(regstate* regs) {
 
     //make a new case for exiting 
     case SYSCALL_EXIT: 
-        exit(current->pid);
+        sys_exit(current->pid); 
+    
+    
         
-        
-        
-        
+    
 
     default:
         proc_panic(current, "Unhandled system call %ld (pid=%d, rip=%p)!\n",

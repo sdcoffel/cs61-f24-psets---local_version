@@ -81,8 +81,6 @@ void kernel_start(const char* command) {
     }
 
 
-    
-
     // set up process descriptors
     for (pid_t i = 0; i < PID_MAX; i++) {
         ptable[i].pid = i;
@@ -218,10 +216,11 @@ void process_setup(pid_t pid, const char* program_name) {
     // allocate and map process memory as specified in program image
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
 
-        perm = PTE_P | PTE_W | PTE_U; 
+        //perm = PTE_P | PTE_W | PTE_U; 
+        perm = PTE_P | PTE_U; // everyone gets P and U permissions 
 
-        if (!seg.writable()){
-            perm ^=PTE_W;   
+        if (seg.writable()){
+            perm |=PTE_W;   //writeable pages get an extra write permission 
         }
        
         for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.size(); a += PAGESIZE) {
@@ -243,7 +242,8 @@ void process_setup(pid_t pid, const char* program_name) {
             
             //log_printf("%p", new_it.va()); 
 
-            int r = new_it.try_map(pa, PTE_P | PTE_W | PTE_U); 
+            //int r = new_it.try_map(pa, PTE_P | PTE_W | PTE_U); 
+            int r = new_it.try_map(pa, perm); 
             assert(r == 0); 
 
         }
@@ -302,7 +302,12 @@ void process_setup(pid_t pid, const char* program_name) {
 void free_everything(x86_64_pagetable* pt){
     for (vmiter it(pt, 0); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE){
         if (it.user() && it.va() != CONSOLE_ADDR){ // if there's actually a physical page mapped here - and its NOT the console address
-            kfree(it.kptr());
+
+            int pageno = it.pa() / PAGESIZE; 
+            physpages[pageno].refcount --; 
+            if (physpages[pageno].refcount == 0){
+                kfree(it.kptr());
+            }
         }
     }
     for (ptiter it(pt); !it.done(); it.next()){

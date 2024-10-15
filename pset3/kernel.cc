@@ -149,7 +149,6 @@ void* kalloc(size_t sz) {
             ++physpages[pageno].refcount; //increment to the next refcount
             memset((void*) pa, 0xCC, PAGESIZE);
             
-            
             return (void*) pa;
         }
         pageno = (pageno + page_increment) % NPAGES;
@@ -312,23 +311,30 @@ void free_everything(x86_64_pagetable* pt){
 
 
 pid_t fork(){
-   int pid = -1; 
+   pid_t pid = - 1; 
    for (int i = 1; i < PID_MAX; i++){
         if (ptable[i].state == P_FREE){
             pid = i; 
             break; 
         }
    }
-   if (pid == -1){
-    return pid; 
+   if (pid < 0){
+    return -1; 
    }
-   ptable[pid].pagetable = kalloc_pagetable(); 
+   
+   x86_64_pagetable *pt = kalloc_pagetable(); 
+   if (pt == nullptr){
+    return -1; 
+   }
+
+   ptable[pid].pagetable = pt; 
      
 //look for a slot in the ptable[] array 
 
 for (uintptr_t addr = 0; addr < MEMSIZE_VIRTUAL; addr += PAGESIZE){
     vmiter parent = vmiter(ptable[current->pid].pagetable,addr);
-        vmiter child = vmiter(ptable[pid].pagetable,addr);
+    vmiter child = vmiter(ptable[pid].pagetable,addr);
+       
         if (parent.present() && parent.user() && addr != CONSOLE_ADDR) {
             void* process_addr = kalloc(PAGESIZE);
             if (process_addr == nullptr) {
@@ -336,13 +342,23 @@ for (uintptr_t addr = 0; addr < MEMSIZE_VIRTUAL; addr += PAGESIZE){
                 return -1;
             }
             int r = child.try_map(process_addr, parent.perm());
-            assert(r == 0);
+           
+            if (r != 0){
+                free_everything(ptable[pid].pagetable);
+                kfree(process_addr); 
+                return -1;  
+            }
 
             //copies over the data
             memcpy(child.kptr(), parent.kptr(), PAGESIZE);
         } else if (parent.present()) {
             int r = child.try_map(parent.pa(), parent.perm());
-            assert(r == 0);
+            if (r != 0){
+                free_everything(ptable[pid].pagetable); 
+                return -1; 
+            }
+            
+            
         }
 
     }

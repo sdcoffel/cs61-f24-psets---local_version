@@ -164,21 +164,17 @@ void* kalloc(size_t sz) {
 //    If `kptr == nullptr` does nothing.
 
 void kfree(void* kptr) {
-    if (kptr == nullptr){
-        return; // do nothing - what has been happening previously with step 6
-
-    uintptr_t pa = (uintptr_t) kptr; 
-    int pageno = pa / PAGESIZE; 
-
-    if (pa % PAGESIZE != 0 || physpages[pageno].refcount == 0){
-        return; 
+    if (kptr == nullptr) {
+        return;
     }
-    
-    --physpages[pageno].refcount; // should decrememnt whatever was done to refcount in kalloc
-
-    if (physpages[pageno].refcount == 0){
-        memset(kptr, 0 , PAGESIZE); 
-        } 
+    uintptr_t pa = (uintptr_t) kptr;
+    log_printf("kfreeing %zu\n",pa);
+    assert(pa % PAGESIZE == 0);
+    int pageno = pa / PAGESIZE;
+    if (allocatable_physical_address(pa)
+        && physpages[pageno].refcount == 1) {
+        --physpages[pageno].refcount;
+        memset(kptr, 0, PAGESIZE);
     }
 }
 
@@ -300,129 +296,67 @@ void process_setup(pid_t pid, const char* program_name) {
 
 
 
-// copy the page tables, with the address logic 
-int copy_page_table(x86_64_pagetable* parent_pt, x86_64_pagetable* child_pt, pid_t parent_pid){
-
-    for (uintptr_t addr = 0; addr < MEMSIZE_VIRTUAL; addr += PAGESIZE){
-        vmiter parent_itr(parent_pt, addr); 
-        vmiter child_itr(child_pt, addr); 
-
-        if (parent_itr.present()){
-            uintptr_t pa = parent_itr.pa(); //grab physical addresses
-            int perm = parent_itr.perm(); //grab permissions
-
-            if (addr >= PROC_START_ADDR && perm & PTE_W){ //we live in allowed virtual memory now, with write permissions
-                pa = (uintptr_t) kalloc(PAGESIZE); 
-                
-                if (!pa){
-                    return 0; //failed to allocate enough space for the physical addresses - out of memory! 
-                }
-                // copy data over into pa, and this is what gets fed into the mapping
-                memcpy((void*)pa, (void*)parent_itr.pa(), PAGESIZE); //copy over all parent info into new allocated pagetable 
-                
-            }
-            // otherwise, we're below PROC_START_ADDR, and we can just straight up copy the physical pages in without changing pa 
-            child_itr.map(pa, perm); 
-        }
-
-    }
-    return 1; //successful copy! 
-}
-
 void free_everything(x86_64_pagetable* pt){
-
     for (vmiter it(pt, 0); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE){
-        if (it.present() && it.va() != 0xB8000){ // if there's actually a physical page mapped here - and its NOT the console address
-
-            log_printf("freeing virtual address 0x%X, physical 0x%X\n", it.va(), it.pa());
+        if (it.user() && it.va() != CONSOLE_ADDR){ // if there's actually a physical page mapped here - and its NOT the console address
+            //log_printf("freeing virtual address 0x%X, physical 0x%X\n", it.va(), it.pa());
             kfree((void*)it.pa()); 
         }
     }
-
     for (ptiter it(pt); !it.done(); it.next()){
         kfree((void*)it.kptr()); 
     }
-
     //free the pagetable
     kfree(pt); 
-
 }
 
 
-
-int fork(pid_t parent_pid){
-
-    log_printf("starting fork\n"); 
-    if(parent_pid < 0 || parent_pid >= PID_MAX || ptable[parent_pid].pid == -1){
-        return -1; 
-    }
-
+pid_t fork(){
+   int pid = -1; 
+   for (int i = 1; i < PID_MAX; i++){
+        if (ptable[i].state == P_FREE){
+            pid = i; 
+            break; 
+        }
+   }
+   if (pid == -1){
+    return pid; 
+   }
+   ptable[pid].pagetable = kalloc_pagetable(); 
      
-    //look for a slot in the ptable[] array 
-   
-    for (int i = 1; i < PID_MAX; ++i){
-        if (ptable[i].state == P_FREE){ // there's a free slot here! 
+//look for a slot in the ptable[] array 
 
-            //create a new, initially empty pagetable for the child 
-            x86_64_pagetable* child_pt = (x86_64_pagetable*) kalloc_pagetable();
-
-            if (!child_pt){
-                return -1; 
+for (uintptr_t addr = 0; addr < MEMSIZE_VIRTUAL; addr += PAGESIZE){
+    vmiter parent = vmiter(ptable[current->pid].pagetable,addr);
+        vmiter child = vmiter(ptable[pid].pagetable,addr);
+        if (parent.present() && parent.user() && addr != CONSOLE_ADDR) {
+            void* process_addr = kalloc(PAGESIZE);
+            if (process_addr == nullptr) {
+                free_everything(ptable[pid].pagetable);
+                return -1;
             }
-            
-            //log_printf("made it here"); 
+            int r = child.try_map(process_addr, parent.perm());
+            assert(r == 0);
 
-            //initialize the child's process entry 
-            ptable[i].pagetable = child_pt; //pointer to the child's new pagetable 
-            ptable[i].pid = i; //set it to the freed id 
-            ptable[i].state = P_RUNNABLE; //set state to runnable 
-            ptable[i].regs = ptable[parent_pid].regs; //copy over the same registers from the parent
-            ptable[i].regs.reg_rax = 0; //set rax to 0 
-
-            //copy parent's pt to child 
-            if (!copy_page_table(ptable[parent_pid].pagetable, child_pt, parent_pid)){ //if the copying fails 
-                log_printf("entered fail condition\n"); 
-                free_everything(child_pt); //free everything
-                return -1; //fail condition
-            }
-
-            return i; //returns child PID
-
-            }
+            //copies over the data
+            memcpy(child.kptr(), parent.kptr(), PAGESIZE);
+        } else if (parent.present()) {
+            int r = child.try_map(parent.pa(), parent.perm());
+            assert(r == 0);
         }
-    return -1; 
+
+    }
+    ptable[pid].regs = current->regs;
+    ptable[pid].regs.reg_rax = 0;
+    ptable[pid].state = P_RUNNABLE;
+    return pid;
 }
 
 
-void sys_exit(pid_t pid){
 
-    // if the process we're interested in freeing isn't already free, call kfree
-    log_printf("made it inside exit function\n");
-    if (ptable[pid].state != P_FREE){
-        
-        x86_64_pagetable* pt = ptable[pid].pagetable;
-
-        if (!pt) return; 
-
-        // iterate through all the virtual addresses in a process's pagetable 
-        for (vmiter it(pt, 0); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE){
-            if (it.present() && it.va() != CONSOLE_ADDR){
-                kfree((void*)it.pa()); // release the corresponding physical memory
-            } 
-        } 
-        
-        // free the page table itself (could have multiple levels)
-        for (ptiter pt_it(pt); !pt_it.done(); pt_it.next()){
-            if (pt_it.pa() != 0){
-                kfree((void*)pt_it.pa()); 
-            }
-        }
-        kfree(pt); 
-        ptable[pid].state = P_FREE; //set state to free 
-        ptable[pid].pagetable = nullptr; //clear pagetable pointer
-        memset(&ptable[pid].regs, 0, sizeof(ptable[pid].regs)); //clear registers
-
-    }
+void sys_exit(){
+    free_everything(ptable[current->pid].pagetable); 
+    current->state = P_FREE; 
 }
 
 
@@ -558,11 +492,12 @@ uintptr_t syscall(regstate* regs) {
         return syscall_page_alloc(current->regs.reg_rdi);
 
     case SYSCALL_FORK: 
-        return fork(current->pid);
+        return fork();
 
     //make a new case for exiting 
     case SYSCALL_EXIT: 
-        sys_exit(current->pid); 
+        sys_exit(); 
+        schedule();  
     
     
         

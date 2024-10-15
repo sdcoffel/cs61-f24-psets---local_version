@@ -70,7 +70,7 @@ void kernel_start(const char* command) {
         }
         // for each kernel address, process cannot touch it - first bit of perm should be 1 
         // want to turn PTE on (1) for processes, off (0) for kernel 
-        if (addr > 0 && addr < 0x100000 && addr != 0xB8000){
+        if (addr > 0 && addr < PROC_START_ADDR  && addr != CONSOLE_ADDR){
             perm = PTE_P | PTE_W;
         }
 
@@ -167,12 +167,11 @@ void kfree(void* kptr) {
         return;
     }
     uintptr_t pa = (uintptr_t) kptr;
-    log_printf("kfreeing %zu\n",pa);
+    
     assert(pa % PAGESIZE == 0);
     int pageno = pa / PAGESIZE;
-    if (allocatable_physical_address(pa)
-        && physpages[pageno].refcount == 1) {
-        --physpages[pageno].refcount;
+    if (allocatable_physical_address(pa) && physpages[pageno].refcount == 1) {
+        physpages[pageno].refcount = 0;
         memset(kptr, 0, PAGESIZE);
     }
 }
@@ -199,7 +198,7 @@ void process_setup(pid_t pid, const char* program_name) {
     
 
     while (kernel_it.va() < PROC_START_ADDR){
-  
+
         //int perm = PTE_P | PTE_W; 
         int r = new_it.try_map(kernel_it.pa(), kernel_it.perm());
         assert(r == 0);  
@@ -214,16 +213,22 @@ void process_setup(pid_t pid, const char* program_name) {
     // (The program image models the process executable.)
     program_image pgm(program_name);
 
+    int perm; 
+
     // allocate and map process memory as specified in program image
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
-       
-       int perm = PTE_P | PTE_U; 
 
-       if (seg.writable()){
-        perm |= PTE_W; //adds write permissions to writable segments
-       }
+        perm = PTE_P | PTE_W | PTE_U; 
+
+        if (!seg.writable()){
+            perm ^=PTE_W;   
+        }
        
         for (uintptr_t a = round_down(seg.va(), PAGESIZE); a < seg.va() + seg.size(); a += PAGESIZE) {
+            uintptr_t pa = (uintptr_t) kalloc(PAGESIZE); 
+             
+
+        
             // `a` is the process virtual address for the next code/data page
             // (The handout code requires that the corresponding physical
             // address is currently free.)
@@ -232,8 +237,7 @@ void process_setup(pid_t pid, const char* program_name) {
             // ++physpages[a / PAGESIZE].refcount;
 
             // map the permissions to a given process 
-            uintptr_t pa = (uintptr_t) kalloc(PAGESIZE); 
-             
+           
             kernel_it = kernel_it.find(a); 
             new_it += kernel_it.va() - new_it.va(); 
             
@@ -266,24 +270,18 @@ void process_setup(pid_t pid, const char* program_name) {
 
     }
 
-
-
-    
-
     // mark entry point
     ptable[pid].regs.reg_rip = pgm.entry();
 
     // allocate and map stack segment
     // Compute process virtual address for stack page
     // uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE; 
-    uintptr_t stack_addr = 0x300000 - PAGESIZE; 
+    uintptr_t stack_addr = MEMSIZE_VIRTUAL - PAGESIZE; //style points
     
     
     uintptr_t pa = (uintptr_t) kalloc(PAGESIZE); 
     // The handout code requires that the corresponding physical address
     // is currently free.
-    // assert(physpages[stack_addr / PAGESIZE].refcount == 0);
-    // ++physpages[stack_addr / PAGESIZE].refcount;
 
     kernel_it = kernel_it.find(stack_addr); 
     new_it += kernel_it.va() - new_it.va();
@@ -296,6 +294,7 @@ void process_setup(pid_t pid, const char* program_name) {
     
     // mark process as runnable
     ptable[pid].state = P_RUNNABLE;  
+    check_pagetable(ptable[pid].pagetable); 
 }
 
 
@@ -303,15 +302,11 @@ void process_setup(pid_t pid, const char* program_name) {
 void free_everything(x86_64_pagetable* pt){
     for (vmiter it(pt, 0); it.va() < MEMSIZE_VIRTUAL; it += PAGESIZE){
         if (it.user() && it.va() != CONSOLE_ADDR){ // if there's actually a physical page mapped here - and its NOT the console address
-            int pageno = it.pa() / PAGESIZE; 
-
-            if (--physpages[pageno].refcount == 0){
-                kfree((void*)it.pa()); // free the page only if nobody else is sharing it 
-            }
+            kfree(it.kptr());
         }
     }
     for (ptiter it(pt); !it.done(); it.next()){
-        kfree((void*)it.kptr()); 
+        kfree(it.kptr()); 
     }
     //free the pagetable
     kfree(pt); 
@@ -319,6 +314,7 @@ void free_everything(x86_64_pagetable* pt){
 
 
 pid_t fork(){
+
    pid_t pid = - 1; 
    for (int i = 1; i < PID_MAX; i++){
         if (ptable[i].state == P_FREE){
@@ -327,10 +323,11 @@ pid_t fork(){
         }
    }
    if (pid < 0){
-    return -1; 
+    return pid; 
    }
    
    x86_64_pagetable *pt = kalloc_pagetable(); 
+
    if (pt == nullptr){
     return -1; 
    }
@@ -343,10 +340,9 @@ for (uintptr_t addr = 0; addr < MEMSIZE_VIRTUAL; addr += PAGESIZE){
     vmiter parent = vmiter(ptable[current->pid].pagetable,addr);
     vmiter child = vmiter(ptable[pid].pagetable,addr);
        
-        if (parent.writable() && parent.user() && addr != CONSOLE_ADDR) {
-
-            
+        if (parent.present() && parent.writable() && parent.user() && addr != CONSOLE_ADDR) {
             void* process_addr = kalloc(PAGESIZE);
+
             if (process_addr == nullptr) {
                 free_everything(ptable[pid].pagetable);
                 return -1;
@@ -359,20 +355,29 @@ for (uintptr_t addr = 0; addr < MEMSIZE_VIRTUAL; addr += PAGESIZE){
                 kfree(process_addr); 
                 return -1;  
             }
-
             //copies over the data
             memcpy(child.kptr(), parent.kptr(), PAGESIZE);
-        } else if (parent.present()) {
+
+
+        } else if (parent.present() && parent.user() && addr != CONSOLE_ADDR) {
             int r = child.try_map(parent.pa(), parent.perm());
+
+            int pageno = (uintptr_t) parent.pa() / PAGESIZE;
+            ++physpages[pageno].refcount;
             
             if (r != 0){
                 free_everything(ptable[pid].pagetable); 
                 return -1; 
             }
-            if (addr != CONSOLE_ADDR && parent.user()){
-                physpages[parent.pa() / PAGESIZE].refcount ++; 
+            
+        } else if (parent.present()){
+            int r = child.try_map(parent.pa(), parent.perm()); 
+
+            if (r != 0){
+                free_everything(ptable[pid].pagetable);
+                return -1;  
             }
-        }   
+        } 
             
     }
 
